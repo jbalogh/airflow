@@ -35,7 +35,8 @@ _operators = {
     's3_to_hive_operator': ['S3ToHiveTransfer'],
     'hive_to_mysql': ['HiveToMySqlTransfer'],
     's3_file_transform_operator': ['S3FileTransformOperator'],
-    }
+    'hive_to_druid': ['HiveToDruidTransfer'],
+}
 
 _import_module_attrs(globals(), _operators)
 
