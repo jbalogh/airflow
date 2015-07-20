@@ -166,6 +166,49 @@ class BaseJob(Base):
         if statsd:
             statsd.incr(self.__class__.__name__.lower()+'_end', 1, 1)
 
+    @utils.provide_session
+    def prioritize_queued(self, session, executor, dagbag, backfill=False):
+        pools = {p.pool: p for p in session.query(models.Pool).all()}
+        TI = models.TaskInstance
+        queued_tis = (
+            session.query(TI)
+            .filter(TI.state == State.QUEUED)
+            .all()
+        )
+        session.expunge_all()
+        d = defaultdict(list)
+        for ti in queued_tis:
+            if not backfill and (
+                    ti.dag_id not in dagbag.dags or
+                    not dagbag.dags[ti.dag_id].has_task(ti.task_id)):
+                # Deleting queued jobs that don't exist anymore
+                session.delete(ti)
+                session.commit()
+            else:
+                d[ti.pool].append(ti)
+
+        for pool, tis in d.items():
+            open_slots = pools[pool].open_slots(session=session)
+            if open_slots > 0:
+                tis = sorted(
+                    tis, key=lambda ti: (-ti.priority_weight, ti.start_date))
+                for ti in tis[:open_slots]:
+                    task = None
+                    try:
+                        task = dagbag.dags[ti.dag_id].get_task(ti.task_id)
+                    except:
+                        if not backfill:
+                            logging.error(
+                                "Queued task {} seems gone".format(ti))
+                            session.delete(ti)
+                    if task:
+                        ti.task = task
+                        if ti.are_dependencies_met():
+                            executor.queue_task_instance(ti, force=True)
+                        else:
+                            session.delete(ti)
+                    session.commit()
+
     def _execute(self):
         raise NotImplemented("This method needs to be overridden")
 
@@ -397,49 +440,6 @@ class SchedulerJob(BaseJob):
 
         session.close()
 
-    @utils.provide_session
-    def prioritize_queued(self, session, executor, dagbag):
-        # Prioritizing queued task instances
-
-        pools = {p.pool: p for p in session.query(models.Pool).all()}
-        TI = models.TaskInstance
-        queued_tis = (
-            session.query(TI)
-            .filter(TI.state == State.QUEUED)
-            .all()
-        )
-        session.expunge_all()
-        d = defaultdict(list)
-        for ti in queued_tis:
-            if (
-                    ti.dag_id not in dagbag.dags or not
-                    dagbag.dags[ti.dag_id].has_task(ti.task_id)):
-                # Deleting queued jobs that don't exist anymore
-                session.delete(ti)
-                session.commit()
-            else:
-                d[ti.pool].append(ti)
-
-        for pool, tis in d.items():
-            open_slots = pools[pool].open_slots(session=session)
-            if open_slots > 0:
-                tis = sorted(
-                    tis, key=lambda ti: (-ti.priority_weight, ti.start_date))
-                for ti in tis[:open_slots]:
-                    task = None
-                    try:
-                        task = dagbag.dags[ti.dag_id].get_task(ti.task_id)
-                    except:
-                        logging.error("Queued task {} seems gone".format(ti))
-                        session.delete(ti)
-                    if task:
-                        ti.task = task
-                        if ti.are_dependencies_met():
-                            executor.queue_task_instance(ti, force=True)
-                        else:
-                            session.delete(ti)
-                    session.commit()
-
     def _execute(self):
         dag_id = self.dag_id
 
@@ -574,8 +574,21 @@ class BackfillJob(BaseJob):
                 ti = models.TaskInstance(task, dttm)
                 tasks_to_run[ti.key] = ti
 
+        # We need a dagbag to pass to prioritize_queued. Since the backfill may
+        # be running a subset of all the tasks, we override dags with our dag.
+        dagbag = models.DagBag()
+        dagbag.dags = {self.dag.dag_id: self.dag}
+
         # Triggering what is ready to get triggered
         while tasks_to_run:
+            try:
+                self.prioritize_queued(
+                    executor=executor,
+                    dagbag=dagbag,
+                    backfill=True)
+            except Exception as e:
+                logging.exception(e)
+
             for key, ti in tasks_to_run.items():
                 ti.refresh_from_db()
                 if ti.state == State.SUCCESS and key in tasks_to_run:
